@@ -22,12 +22,22 @@
 // Then it times the full CPU pipeline (two flows + blur) at 1920×1080 and
 // writes a few images as PPM.
 //
-// Usage: smear_bench [out_dir] [--no-images] [--no-timing] [--scene name]
+// Usage: smear_bench [out_dir] [options]
+//   --scene NAME        only this scene
+//   --quality 1|2|3     Draft / Normal (default) / Best
+//   --sensitivity S     Motion Sensitivity, 0–100 (default 50)
+//   --no-images         do not write PPM images
+//   --no-timing         skip the 1920×1080 timing
+//   --true-flow         feed the true flow to every renderer (isolates reconstruction)
+//   --debug             also report motion-vector error and layer classification,
+//                       and write occlusion / layer / vector-error images
+//   --probe X Y         with --debug: print the vectors and scores of pixel (X, Y)
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
@@ -133,6 +143,7 @@ struct Object {
 struct Scene {
     std::string name, what;
     int width = 640, height = 360;
+    float grain = 0;  // film grain added to every rendered frame (and to the truth), std. deviation
     std::vector<Object> objects;  // back to front
 
     int visible(double px, double py, double t, double& u, double& v) const {
@@ -242,6 +253,13 @@ std::vector<Scene> scenes() {
         s.push_back(c);
     }
     {
+        Scene c = s[0];
+        c.name = "object_grain";
+        c.what = "the first scene with film grain (σ = 3% per channel, new each frame)";
+        c.grain = 0.03f;
+        s.push_back(c);
+    }
+    {
         Scene c;
         c.name = "static";
         c.what = "nothing moves";
@@ -271,6 +289,21 @@ Image render_instant(const Scene& sc, double t, int ss) {
         }
     });
     return img;
+}
+
+// Gaussian-ish grain (sum of uniforms), a new pattern per `frame`.
+void add_grain(Image& img, float sigma, uint32_t frame) {
+    if (sigma <= 0) return;
+    for (int y = 0; y < img.height; ++y)
+        for (int x = 0; x < img.width; ++x) {
+            Pixel& p = img.at(x, y);
+            float* ch[3] = {&p.r, &p.g, &p.b};
+            for (int c = 0; c < 3; ++c) {
+                double u = 0;
+                for (int k = 0; k < 4; ++k) u += lattice(x, y, frame * 977u + uint32_t(c * 4 + k) * 131u) - 0.5;
+                *ch[c] += float(u * std::sqrt(3.0)) * sigma;  // 4 uniforms: variance 1/3
+            }
+        }
 }
 
 Image render_truth(const Scene& sc, double shutter, int subframes = 64) {
@@ -473,6 +506,10 @@ int main(int argc, char** argv) {
         else out_dir = argv[i];
     }
 
+    if (images || debug) {
+        std::error_code ec;
+        std::filesystem::create_directories(out_dir, ec);
+    }
     const double shutter = 0.5;
     smear::FlowSettings fs;
     fs.quality = smear::Quality(quality);
@@ -487,10 +524,15 @@ int main(int argc, char** argv) {
                 "band error naive / smear / smear·true-flow |\n");
     std::printf("| --- | --- | --- | --- |\n");
     double sum_naive = 0, sum_smear = 0;
+    int scenes_run = 0;
     for (const Scene& sc : scenes()) {
         if (!only.empty() && sc.name != only) continue;
-        const Image prev = render_instant(sc, -1, 4), cur = render_instant(sc, 0, 4), next = render_instant(sc, 1, 4);
-        const Image truth = render_truth(sc, shutter);
+        Image prev = render_instant(sc, -1, 4), cur = render_instant(sc, 0, 4), next = render_instant(sc, 1, 4);
+        Image truth = render_truth(sc, shutter);
+        add_grain(prev, sc.grain, 1);
+        add_grain(cur, sc.grain, 2);
+        add_grain(truth, sc.grain, 2);  // the grain of frame 0, unblurred, as a camera would record it
+        add_grain(next, sc.grain, 3);
         const FlowField tp = true_flow(sc, -1), tn = true_flow(sc, 1);
         const std::vector<uint8_t> band = occlusion_band(sc, tn, shutter);
 
@@ -511,6 +553,7 @@ int main(int argc, char** argv) {
         const Err a = compare(naive, truth, band), b = compare(ours, truth, band), c = compare(ours_true, truth, band);
         sum_naive += a.band_mae;
         sum_smear += b.band_mae;
+        ++scenes_run;
         std::printf("| %s | %.2f / %.2f | %.1f / %.1f / %.1f | %.2f / %.2f / %.2f |\n", sc.name.c_str(),
                     0.5 * (en.all + ep.all), 0.5 * (en.band + ep.band), a.psnr, b.psnr, c.psnr, a.band_mae,
                     b.band_mae, c.band_mae);
@@ -572,7 +615,7 @@ int main(int argc, char** argv) {
             }
             const std::string p = out_dir + "/" + sc.name;
             write_ppm(p + "_occ.ppm", occ);
-            write_ppm(p + "_front.ppm", front);
+            write_ppm(p + "_layers.ppm", front);  // red: judged in front, green: band, blue: truly in front
             write_ppm(p + "_mverr.ppm", err);
         }
         if (images) {
@@ -587,7 +630,9 @@ int main(int argc, char** argv) {
             write_ppm(p + "_vectors.ppm", vectors);
         }
     }
-    std::printf("\nMean band error: naive %.2f, smear %.2f\n", sum_naive, sum_smear);
+    if (scenes_run)
+        std::printf("\nBand error averaged over the scenes: naive %.2f, smear %.2f (%.0f%% lower)\n",
+                    sum_naive / scenes_run, sum_smear / scenes_run, 100.0 * (1.0 - sum_smear / std::max(sum_naive, 1e-9)));
 
     if (timing) {
         const Scene big = scenes()[0].scaled(3.0);  // 1920×1080

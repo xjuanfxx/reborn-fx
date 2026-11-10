@@ -4,24 +4,32 @@
 // no global state, no caches, so frames render in any order and in parallel.
 //
 // Optical flow: coarse-to-fine patch inverse search with densification, after
-// Kroeger et al. 2016, "Fast Optical Flow using Dense Inverse Search" (DIS).
+// Kroeger et al. 2016, "Fast Optical Flow using Dense Inverse Search" (DIS),
+// plus a few additions for large motions and sharp motion boundaries.
 // Per pyramid level, from coarse to fine:
 //
-//   1. patch search: overlapping square patches of the `from` image, each one
-//      initialised with the coarser level's flow at its centre, refined with a
-//      few inverse-compositional Gauss-Newton steps (the Hessian of the
-//      template is constant, so each step costs one warp of the patch).
-//      Patches are mean-normalised (robust to small exposure changes) and keep
-//      the best estimate seen, so a step can never make a patch worse.
+//   1. patch search: overlapping square patches of the `from` image. Each one
+//      starts from the coarser level's flow, tried at its centre and one patch
+//      away in eight directions (the side of a motion boundary the patch
+//      mostly covers wins); then an integer search within ±radius (wide on the
+//      two coarsest levels); then inverse-compositional Gauss-Newton steps
+//      (the template Hessian is constant, so a step costs one warp of the
+//      patch). Patches are mean-normalised (robust to small exposure changes)
+//      and keep the best estimate seen, so no step can make a patch worse. On
+//      the finest searched level (half resolution at most), patches that are
+//      still poorly matched get a wide "rescue" search: thin, fast objects
+//      vanish from coarse levels, so nothing coarser can hand their motion down.
 //   2. densify: each pixel takes the average of the flows of the patches that
 //      cover it, weighted by how well each flow explains that very pixel
 //      (inverse photometric error). Patches straddling a motion boundary thus
 //      contribute their flow only to the side they match.
 //
-// Draft and Normal stop at quarter and half resolution; the last step is a
-// photometric upsampling to full resolution (each full-resolution pixel picks
-// among the four nearest coarse flows by how well they match it), which keeps
-// motion boundaries on image edges instead of blurring them.
+// Draft and Normal stop at quarter and half resolution and upsample to full
+// resolution photometrically (each pixel weighs the four nearest coarse flows
+// by how well they match it). Finally, full-resolution refinement passes let
+// each pixel adopt a neighbour's vector (8 directions, a few pixels away) when
+// it matches a 3×3 window better, which snaps motion boundaries to image edges.
+// All passes are local, fixed-size gathers: they map one-to-one to GPU kernels.
 //
 // The GPU kernels (plugin/gpu/smear_kernels.inc) implement the same passes with
 // the same arithmetic; tests/test_gpu_path.cpp runs them on the CPU and compares.
@@ -74,7 +82,7 @@ enum class Quality { Draft = 1, Normal = 2, Best = 3 };
 
 struct FlowSettings {
     // Motion Sensitivity, 0–100: higher follows finer detail (smaller patches),
-    // lower gives smoother, steadier vectors (larger patches, more smoothing).
+    // lower gives smoother, steadier vectors (larger patches).
     double sensitivity = 50;
     Quality quality = Quality::Normal;
 };
@@ -87,6 +95,9 @@ struct FlowPlan {
     int stride = 4;        // distance between patch origins
     int iterations = 12;   // Gauss-Newton steps per patch
     int search_radius = 3; // integer search around the initial flow before the steps, pixels
+    int rescue_radius = 48;     // finest level: wide search (full-resolution pixels) for patches still poorly matched…
+    float rescue_ratio = 0.5f;  // …i.e. with a residual above this fraction of their variance…
+    float rescue_min_var = 1e-4f;  // …and enough texture (variance per pixel) to be matched at all
     int refine_steps[3] = {4, 1, 0};  // full-resolution boundary refinement passes (0 = off); Best adds a third
     float photo_eps = 0.02f;    // densify / upsample: errors below this weigh the same
     float max_step = 4.0f;      // longest single Gauss-Newton step, pixels
@@ -110,6 +121,7 @@ inline FlowPlan plan_flow(const FlowSettings& fs, int width, int height) {
             finest = 2;
             p.iterations = 8;
             p.refine_steps[1] = 0;
+            p.rescue_radius = 0;
             p.stride = std::max(2, p.patch / 2);
             break;
         case Quality::Normal:
@@ -304,9 +316,36 @@ inline float patch_cost(const Level& L, int ox, int oy, int ps, float mt, float 
     return (sww - sw * sw / float(ps * ps)) - 2.0f * swt + var_t;
 }
 
+// Integer displacements within ±r of `around` (rounded): keeps the best one in
+// best/best_e (sum of squared mean-normalised differences).
+inline void integer_search(const Level& L, int ox, int oy, int ps, float mt, float var_t, Vec2 around, int r,
+                           Vec2& best, float& best_e) {
+    const float inv_n = 1.0f / float(ps * ps);
+    const int rx = int(std::floor(around.x + 0.5f)), ry = int(std::floor(around.y + 0.5f));
+    for (int dy = -r; dy <= r; ++dy)
+        for (int dx = -r; dx <= r; ++dx) {
+            float sw = 0, sww = 0, swt = 0;
+            for (int ky = 0; ky < ps; ++ky) {
+                const int sy = clampi(oy + ky + ry + dy, 0, L.height - 1);
+                for (int kx = 0; kx < ps; ++kx) {
+                    const int sx = clampi(ox + kx + rx + dx, 0, L.width - 1);
+                    const float wv = L.at(sx, sy).y;
+                    sw += wv;
+                    sww += wv * wv;
+                    swt += wv * (L.at(ox + kx, oy + ky).x - mt);
+                }
+            }
+            const float e = (sww - sw * sw * inv_n) - 2.0f * swt + var_t;
+            if (e < best_e) {
+                best_e = e;
+                best = {float(rx + dx), float(ry + dy)};
+            }
+        }
+}
+
 // Flow of patch (i, j). `coarse`: the dense flow of the next coarser level, or null.
 inline Vec2 patch_search_one(const Level& L, const FlowField* coarse, const FlowPlan& plan, const PatchGrid& g,
-                             int radius, int i, int j) {
+                             int radius, int rescue, int i, int j) {
     const int ps = g.patch, n = ps * ps;
     const int ox = patch_origin(i, g.stride, ps, L.width), oy = patch_origin(j, g.stride, ps, L.height);
     const float cx = float(ox) + float(ps - 1) * 0.5f, cy = float(oy) + float(ps - 1) * 0.5f;
@@ -360,32 +399,17 @@ inline Vec2 patch_search_one(const Level& L, const FlowField* coarse, const Flow
     }
 
     // Integer search around the initial flow: widens the capture range of each
-    // level from the patch's own texture scale to ±search_radius pixels, so
-    // motions too fast for the coarse levels are still found.
+    // level from the patch's own texture scale to ±radius pixels, so motions
+    // too fast for the coarse levels are still found.
     Vec2 best = u;
     float best_e = 3.0e38f;
     if (radius > 0) {
-        const int rx = int(std::floor(u.x + 0.5f)), ry = int(std::floor(u.y + 0.5f));
-        const int r = radius;
-        for (int dy = -r; dy <= r; ++dy)
-            for (int dx = -r; dx <= r; ++dx) {
-                float sw = 0, sww = 0, swt = 0;
-                for (int ky = 0; ky < ps; ++ky) {
-                    const int sy = clampi(oy + ky + ry + dy, 0, L.height - 1);
-                    for (int kx = 0; kx < ps; ++kx) {
-                        const int sx = clampi(ox + kx + rx + dx, 0, L.width - 1);
-                        const float wv = L.at(sx, sy).y;
-                        sw += wv;
-                        sww += wv * wv;
-                        swt += wv * (L.at(ox + kx, oy + ky).x - mt);
-                    }
-                }
-                const float e = (sww - sw * sw * inv_n) - 2.0f * swt + var_t;
-                if (e < best_e) {
-                    best_e = e;
-                    best = {float(rx + dx), float(ry + dy)};
-                }
-            }
+        integer_search(L, ox, oy, ps, mt, var_t, u, radius, best, best_e);
+        u = best;
+    }
+    // Rescue: a patch still poorly matched gets a much wider search.
+    if (rescue > 0 && best_e > plan.rescue_ratio * var_t && var_t > plan.rescue_min_var * float(n)) {
+        integer_search(L, ox, oy, ps, mt, var_t, u, rescue, best, best_e);
         u = best;
     }
     for (int it = 0; it <= plan.iterations; ++it) {
@@ -427,12 +451,22 @@ inline int search_radius(const FlowPlan& p, int level) {
     return level >= p.coarsest - 1 ? std::max(p.search_radius, p.patch) : p.search_radius;
 }
 
+// Rescue search radius at `level`, in level pixels: only on the finest searched
+// level, or half resolution for Best (0 = none). Thin, fast objects vanish from the coarse levels, so
+// nothing coarser can hand their motion down.
+inline int rescue_radius(const FlowPlan& p, int level) {
+    const int at = std::max(p.finest, 1);  // never at full resolution: too costly for what it adds
+    return (p.rescue_radius > 0 && level == at && level < p.coarsest - 1)
+               ? std::max(p.search_radius + 1, p.rescue_radius >> level)
+               : 0;
+}
+
 inline FlowField patch_search(const Level& L, const FlowField* coarse, const FlowPlan& plan, int level) {
     const PatchGrid g = patch_grid(plan, L.width, L.height);
-    const int radius = search_radius(plan, level);
+    const int radius = search_radius(plan, level), rescue = rescue_radius(plan, level);
     FlowField out(g.nx, g.ny);
     parallel_for(g.ny, [&](int j) {
-        for (int i = 0; i < g.nx; ++i) out.at(i, j) = patch_search_one(L, coarse, plan, g, radius, i, j);
+        for (int i = 0; i < g.nx; ++i) out.at(i, j) = patch_search_one(L, coarse, plan, g, radius, rescue, i, j);
     });
     return out;
 }
@@ -517,6 +551,7 @@ inline Vec2 refine_one(const Level& L0, const FlowField& flow, int step, int x, 
     for (int k = 0; k < 8; ++k) {
         const int px = clampi(x + kOffX[k] * step, 0, flow.width - 1), py = clampi(y + kOffY[k] * step, 0, flow.height - 1);
         const Vec2 u = flow.at(px, py);
+        if (std::fabs(u.x - best.x) + std::fabs(u.y - best.y) < 0.05f) continue;  // same vector: nothing to gain
         const float e = window_error(L0, x, y, u);
         if (e < best_e) {
             best_e = e;

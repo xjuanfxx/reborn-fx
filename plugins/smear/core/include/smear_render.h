@@ -8,18 +8,25 @@
 //
 //   1. motion:     per pixel, the blur vector (half the shutter-long streak) and
 //                  an occlusion score. With both neighbours, the two flows of a
-//                  pixel visible in all three frames must agree (to_next ≈
-//                  −to_prev: forward-backward consistency under locally
-//                  constant velocity). Where they disagree, the flow whose
-//                  target does not match the pixel's colour is the one that
-//                  lost the pixel behind something: the pixel is occluded on
-//                  that side, and its motion comes from the other flow.
+//                  pixel visible in all three frames agree (to_next ≈ −to_prev:
+//                  forward-backward consistency under locally constant
+//                  velocity), and both land on the pixel's colour. Where they
+//                  disagree, the flow whose target does not match is the one
+//                  that lost the pixel behind something: the pixel is occluded
+//                  on that side, and its motion comes from the other flow.
+//      refine:     a pixel adopts a neighbour's vector when that single centred
+//                  velocity explains it better in both neighbour frames; three
+//                  frames constrain far more than two, so vectors that bled
+//                  across an object's edge are corrected.
 //   2. tiles:      per 16×16 tile, the longest blur vector, and the
 //                  occlusion-weighted sum of blur vectors (occluded pixels
 //                  belong to the layer that is behind).
 //   3. neighbours: per tile, the dominant vector among all tiles whose streaks
 //                  can reach it, and the velocity of the background layer
-//                  around it (from the occluded pixels).
+//                  around it (from the occluded pixels). Passes 2–3 run three
+//                  times: each round down-weights occluded pixels far from the
+//                  previous background estimate, so a few misjudged pixels of
+//                  the front layer cannot drag it.
 //   4. gather:     a reconstruction filter after McGuire et al. 2012 ("A
 //                  Reconstruction Filter for Plausible Motion Blur") with the
 //                  tile/neighbour-max scheme of Jimenez 2014. Pixels moving
@@ -163,6 +170,7 @@ inline Vec4 refine_motion_cell(const Image& cur, const Image* prev, const Image*
     for (int k = 0; k < 8; ++k) {
         const int px = clampi(x + kOffX[k] * step, 0, mot.width - 1), py = clampi(y + kOffY[k] * step, 0, mot.height - 1);
         const Vec4 m = mot.at(px, py);
+        if (std::fabs(m.x - best.x) + std::fabs(m.y - best.y) < 0.01f) continue;  // same vector: nothing to gain
         float occ = 0.0f;
         const float e = motion_cost(c, prev, next, x, y, m.x * inv_half, m.y * inv_half, t, occ);
         if (e < best_e) {
@@ -353,23 +361,29 @@ inline Pixel gather_cell(const Image& cur, const Grid<Vec4>& mot, const Grid<Vec
 
     // Sample counts: up to one per pixel of streak, split between the dominant
     // direction (front layers covering us) and our own (our layer's blur).
+    // When our own vector is the dominant one, nothing nearby moves faster
+    // over us: all samples go to our own streak.
     const int budget = std::max(4, gp.max_samples);
+    const float dnx = nm.x - m.x, dny = nm.y - m.y;
+    const bool own_dominant = dnx * dnx + dny * dny < 0.25f;
     int nb = 0;
-    if (lx >= 0.5f) nb = std::min(budget / 2, std::max(2, 2 * int(std::ceil(lx))));
+    if (lx >= 0.5f) nb = std::min(own_dominant ? budget : budget / 2, std::max(2, 2 * int(std::ceil(lx))));
     nb &= ~1;
-    int na = std::min(budget - nb, std::max(2, 2 * int(std::ceil(ln))));
-    na = std::max(2, na & ~1);
+    int na = 0;
+    if (!own_dominant) {
+        na = std::min(budget - nb, std::max(2, 2 * int(std::ceil(ln))));
+        na = std::max(2, na & ~1);
+    }
 
     const float ndx = nm.x / ln, ndy = nm.y / ln;
     const float lxn = std::fabs(m.x * ndx + m.y * ndy);  // our streak along the dominant direction
 
     // Front coverage (layers whose streaks pass over this pixel).
     float fw = 0, fr = 0, fg = 0, fb = 0, fa = 0;
-    const float da = 2.0f * ln / float(na);
+    const float da = na > 0 ? 2.0f * ln / float(na) : 0.0f;
     for (int i = 0; i < na; ++i) {
         const float s = -1.0f + (2.0f * float(i) + 1.0f) / float(na);
-        const float px = float(x) + s * nm.x, py = float(y) + s * nm.y;
-        if (!(px > -0.5f && py > -0.5f && px < float(w) - 0.5f && py < float(h) - 0.5f)) continue;
+        const float px = float(x) + s * nm.x, py = float(y) + s * nm.y;  // outside: edge pixels extend
         const int ix = clampi(int(std::floor(px + 0.5f)), 0, w - 1), iy = clampi(int(std::floor(py + 0.5f)), 0, h - 1);
         const Vec4 my = mot.at(ix, iy);
         const float zy = front_score(my.x, my.y, bgx, bgy, gp.to_velocity, gate, t);
@@ -390,14 +404,13 @@ inline Pixel gather_cell(const Image& cur, const Grid<Vec4>& mot, const Grid<Vec
     }
 
     // Own layer (and whatever is behind it) blurred along our own streak.
-    const float wc = 1.0f / (2.0f * lx + 1.0f);
+    const float wc = (nb > 0 ? 0.01f : 1.0f) / (2.0f * lx + 1.0f);  // the streak samples already cover this pixel
     float bw = wc, br = wc * c.r, bg = wc * c.g, bb = wc * c.b, ba = wc * c.a;
     if (nb > 0) {
         const float db = 2.0f * lx / float(nb);
         for (int i = 0; i < nb; ++i) {
             const float s = -1.0f + (2.0f * float(i) + 1.0f) / float(nb);
             const float px = float(x) + s * m.x, py = float(y) + s * m.y;
-            if (!(px > -0.5f && py > -0.5f && px < float(w) - 0.5f && py < float(h) - 0.5f)) continue;
             const int ix = clampi(int(std::floor(px + 0.5f)), 0, w - 1),
                       iy = clampi(int(std::floor(py + 0.5f)), 0, h - 1);
             const Vec4 my = mot.at(ix, iy);

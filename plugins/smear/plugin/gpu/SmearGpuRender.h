@@ -125,6 +125,9 @@ inline bool compute_flow(Backend& gpu, FlowWorkspace& ws, const Buffer& from, co
         pp.patch_pitch = ws.patches.pitch;
         pp.iterations = plan.iterations;
         pp.radius = search_radius(plan, l);
+        pp.rescue = rescue_radius(plan, l);
+        pp.rescue_ratio = plan.rescue_ratio;
+        pp.rescue_min_var = plan.rescue_min_var;
         pp.max_step = plan.max_step;
         pp.min_det = plan.min_det;
         if (!run(gpu, "smear_flow_patches", g.nx, g.ny, {L.mem, coarse.mem, ws.patches.mem}, pp)) return false;

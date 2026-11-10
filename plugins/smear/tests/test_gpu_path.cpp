@@ -17,16 +17,16 @@ namespace {
 
 test::Scene moving_square() {
     test::Scene s;
-    s.w = 112;
-    s.h = 80;
+    s.w = 176;
+    s.h = 120;
     s.bvx = -2.5f;
     s.bvy = 1.0f;
     s.square = true;
-    s.cx = 50;
-    s.cy = 40;
-    s.half = 15;
-    s.fvx = 7.0f;
-    s.fvy = -1.5f;
+    s.cx = 80;
+    s.cy = 60;
+    s.half = 20;
+    s.fvx = 16.0f;
+    s.fvy = -3.0f;
     return s;
 }
 
@@ -45,6 +45,8 @@ void test_flow_matches(smear::Quality q, double sensitivity) {
     CpuScratch scratch;
     CHECK(smear::gpu::compute_flow(gpu, scratch, ga.buf, gb.buf, fs, out.buf));
     CHECK(gpu.missing.empty());
+    const smear::FlowPlan plan = smear::plan_flow(fs, a.width, a.height);
+    std::printf("      levels %d..%d, rescue radius %d\n", plan.coarsest, plan.finest, smear::rescue_radius(plan, plan.finest));
     const double d = test::mean_flow_diff(cpu, out.field());
     std::printf("flow  quality %d sensitivity %3.0f: mean |gpu - cpu| = %.2e px (%d passes)\n", int(q), sensitivity, d,
                 gpu.passes);

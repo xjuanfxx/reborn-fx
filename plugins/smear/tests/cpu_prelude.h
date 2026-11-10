@@ -64,36 +64,63 @@ inline bool add(const char* name, Launch fn) {
 #define F4(a, b, c, d) float4{(a), (b), (c), (d)}
 #define F2(a, b) float2{(a), (b)}
 
-// Each kernel: a body function per thread, a launcher over the grid, a registration.
-#define SMEAR_CPU_KERNEL(name, P, PARAMS, ARGS)                                              \
-    static void name##_body(const int x, const int y, PARAMS, const P& p);                   \
+// Each kernel: a body function per thread, a launcher over the grid (rows in
+// parallel) and a registration by name.
+#define KERNEL_B2(name, P, T0, a0, T1, a1)                                         \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, const P& p);   \
+    static void name##_launch(int w, int h, void* const* b, const void* pp) {      \
+        const P& p = *static_cast<const P*>(pp);                                   \
+        smear::parallel_for(h, [&](int y) {                                        \
+            for (int x = 0; x < w; ++x) name##_body(x, y, (T0)b[0], (T1)b[1], p);  \
+        });                                                                        \
+    }                                                                              \
+    static const bool name##_registered = add(#name, &name##_launch);              \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, const P& p) {
+
+#define KERNEL_B3(name, P, T0, a0, T1, a1, T2, a2)                                           \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, const P& p);      \
     static void name##_launch(int w, int h, void* const* b, const void* pp) {                \
         const P& p = *static_cast<const P*>(pp);                                             \
         smear::parallel_for(h, [&](int y) {                                                  \
-            for (int x = 0; x < w; ++x) name##_body(x, y, ARGS, p);                          \
+            for (int x = 0; x < w; ++x) name##_body(x, y, (T0)b[0], (T1)b[1], (T2)b[2], p);  \
         });                                                                                  \
     }                                                                                        \
     static const bool name##_registered = add(#name, &name##_launch);                        \
-    static void name##_body(const int x, const int y, PARAMS, const P& p) {
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, const P& p) {
 
-#define SMEAR_COMMA ,
-#define KERNEL_B2(n, P, T0, a0, T1, a1) \
-    SMEAR_CPU_KERNEL(n, P, T0 a0 SMEAR_COMMA T1 a1, (T0)b[0] SMEAR_COMMA(T1) b[1])
-#define KERNEL_B3(n, P, T0, a0, T1, a1, T2, a2)                     \
-    SMEAR_CPU_KERNEL(n, P, T0 a0 SMEAR_COMMA T1 a1 SMEAR_COMMA T2 a2, \
-                     (T0)b[0] SMEAR_COMMA(T1) b[1] SMEAR_COMMA(T2) b[2])
-#define KERNEL_B4(n, P, T0, a0, T1, a1, T2, a2, T3, a3)                                \
-    SMEAR_CPU_KERNEL(n, P, T0 a0 SMEAR_COMMA T1 a1 SMEAR_COMMA T2 a2 SMEAR_COMMA T3 a3, \
-                     (T0)b[0] SMEAR_COMMA(T1) b[1] SMEAR_COMMA(T2) b[2] SMEAR_COMMA(T3) b[3])
-#define KERNEL_B5(n, P, T0, a0, T1, a1, T2, a2, T3, a3, T4, a4)                                          \
-    SMEAR_CPU_KERNEL(n, P, T0 a0 SMEAR_COMMA T1 a1 SMEAR_COMMA T2 a2 SMEAR_COMMA T3 a3 SMEAR_COMMA T4 a4, \
-                     (T0)b[0] SMEAR_COMMA(T1) b[1] SMEAR_COMMA(T2) b[2] SMEAR_COMMA(T3) b[3] SMEAR_COMMA(T4) b[4])
-#define KERNEL_B6(n, P, T0, a0, T1, a1, T2, a2, T3, a3, T4, a4, T5, a5)                                \
-    SMEAR_CPU_KERNEL(n, P,                                                                             \
-                     T0 a0 SMEAR_COMMA T1 a1 SMEAR_COMMA T2 a2 SMEAR_COMMA T3 a3 SMEAR_COMMA T4 a4     \
-                         SMEAR_COMMA T5 a5,                                                            \
-                     (T0)b[0] SMEAR_COMMA(T1) b[1] SMEAR_COMMA(T2) b[2] SMEAR_COMMA(T3) b[3]           \
-                         SMEAR_COMMA(T4) b[4] SMEAR_COMMA(T5) b[5])
+#define KERNEL_B4(name, P, T0, a0, T1, a1, T2, a2, T3, a3)                                             \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, T3 a3, const P& p);         \
+    static void name##_launch(int w, int h, void* const* b, const void* pp) {                          \
+        const P& p = *static_cast<const P*>(pp);                                                       \
+        smear::parallel_for(h, [&](int y) {                                                            \
+            for (int x = 0; x < w; ++x) name##_body(x, y, (T0)b[0], (T1)b[1], (T2)b[2], (T3)b[3], p);  \
+        });                                                                                            \
+    }                                                                                                  \
+    static const bool name##_registered = add(#name, &name##_launch);                                  \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, T3 a3, const P& p) {
+
+#define KERNEL_B5(name, P, T0, a0, T1, a1, T2, a2, T3, a3, T4, a4)                                               \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, T3 a3, T4 a4, const P& p);            \
+    static void name##_launch(int w, int h, void* const* b, const void* pp) {                                    \
+        const P& p = *static_cast<const P*>(pp);                                                                 \
+        smear::parallel_for(h, [&](int y) {                                                                      \
+            for (int x = 0; x < w; ++x) name##_body(x, y, (T0)b[0], (T1)b[1], (T2)b[2], (T3)b[3], (T4)b[4], p);  \
+        });                                                                                                      \
+    }                                                                                                            \
+    static const bool name##_registered = add(#name, &name##_launch);                                            \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, T3 a3, T4 a4, const P& p) {
+
+#define KERNEL_B6(name, P, T0, a0, T1, a1, T2, a2, T3, a3, T4, a4, T5, a5)                                                 \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, T3 a3, T4 a4, T5 a5, const P& p);               \
+    static void name##_launch(int w, int h, void* const* b, const void* pp) {                                              \
+        const P& p = *static_cast<const P*>(pp);                                                                           \
+        smear::parallel_for(h, [&](int y) {                                                                                \
+            for (int x = 0; x < w; ++x) name##_body(x, y, (T0)b[0], (T1)b[1], (T2)b[2], (T3)b[3], (T4)b[4], (T5)b[5], p);  \
+        });                                                                                                                \
+    }                                                                                                                      \
+    static const bool name##_registered = add(#name, &name##_launch);                                                      \
+    static void name##_body(const int x, const int y, T0 a0, T1 a1, T2 a2, T3 a3, T4 a4, T5 a5, const P& p) {
+
 #define KERNEL_END }
 
 namespace smear_cpu {

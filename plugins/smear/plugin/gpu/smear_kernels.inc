@@ -172,7 +172,35 @@ DEVICE float smear_patch_cost(GBUF_CONST L, int pitch, int w, int h, int ox, int
     return (sww - sw * sw / (float)(ps * ps)) - 2.0f * swt + var_t;
 }
 
-/* One patch: candidates from the coarse flow, integer search, then
+/* Integer displacements within ±r of (ax, ay) rounded; keeps the best. */
+DEVICE void smear_integer_search(GBUF_CONST L, int lp, int w, int h, int ox, int oy, int ps, float mt, float var_t,
+                                 float ax, float ay, int r, PRIV float* best_x, PRIV float* best_y, PRIV float* best_e) {
+    const float inv_n = 1.0f / (float)(ps * ps);
+    const int rx = (int)floor(ax + 0.5f), ry = (int)floor(ay + 0.5f);
+    for (int dy = -r; dy <= r; ++dy)
+        for (int dx = -r; dx <= r; ++dx) {
+            float sw = 0.0f, sww = 0.0f, swt = 0.0f;
+            for (int ky = 0; ky < ps; ++ky) {
+                const int sy = smear_clampi(oy + ky + ry + dy, 0, h - 1);
+                for (int kx = 0; kx < ps; ++kx) {
+                    const int sx = smear_clampi(ox + kx + rx + dx, 0, w - 1);
+                    const float wv = L[sy * lp + sx].y;
+                    sw += wv;
+                    sww += wv * wv;
+                    swt += wv * (L[(oy + ky) * lp + ox + kx].x - mt);
+                }
+            }
+            const float e = (sww - sw * sw * inv_n) - 2.0f * swt + var_t;
+            if (e < *best_e) {
+                *best_e = e;
+                *best_x = (float)(rx + dx);
+                *best_y = (float)(ry + dy);
+            }
+        }
+}
+
+/* One patch: candidates from the coarse flow, integer search (and a wide
+ * rescue search if still poorly matched), then
  * inverse-compositional Gauss-Newton steps, keeping the best estimate seen. */
 KERNEL_B3(smear_flow_patches, SmearPatchParams, GBUF_CONST, L, GBUF2_CONST, coarse, GBUF2, patches)
     if (x >= p.nx || y >= p.ny) return;
@@ -231,28 +259,12 @@ KERNEL_B3(smear_flow_patches, SmearPatchParams, GBUF_CONST, L, GBUF2_CONST, coar
 
     float best_x = ux, best_y = uy, best_e = 3.0e38f;
     if (p.radius > 0) {
-        const int rx = (int)floor(ux + 0.5f), ry = (int)floor(uy + 0.5f);
-        const int r = p.radius;
-        for (int dy = -r; dy <= r; ++dy)
-            for (int dx = -r; dx <= r; ++dx) {
-                float sw = 0.0f, sww = 0.0f, swt = 0.0f;
-                for (int ky = 0; ky < ps; ++ky) {
-                    const int sy = smear_clampi(oy + ky + ry + dy, 0, p.h - 1);
-                    for (int kx = 0; kx < ps; ++kx) {
-                        const int sx = smear_clampi(ox + kx + rx + dx, 0, p.w - 1);
-                        const float wv = L[sy * lp + sx].y;
-                        sw += wv;
-                        sww += wv * wv;
-                        swt += wv * (L[(oy + ky) * lp + ox + kx].x - mt);
-                    }
-                }
-                const float e = (sww - sw * sw * inv_n) - 2.0f * swt + var_t;
-                if (e < best_e) {
-                    best_e = e;
-                    best_x = (float)(rx + dx);
-                    best_y = (float)(ry + dy);
-                }
-            }
+        smear_integer_search(L, lp, p.w, p.h, ox, oy, ps, mt, var_t, ux, uy, p.radius, &best_x, &best_y, &best_e);
+        ux = best_x;
+        uy = best_y;
+    }
+    if (p.rescue > 0 && best_e > p.rescue_ratio * var_t && var_t > p.rescue_min_var * (float)n) {
+        smear_integer_search(L, lp, p.w, p.h, ox, oy, ps, mt, var_t, ux, uy, p.rescue, &best_x, &best_y, &best_e);
         ux = best_x;
         uy = best_y;
     }
@@ -360,6 +372,7 @@ KERNEL_B3(smear_flow_refine, SmearRefineParams, GBUF_CONST, L, GBUF2_CONST, src,
         const int px = smear_clampi(x + smear_offx(k) * p.dist, 0, p.w - 1);
         const int py = smear_clampi(y + smear_offy(k) * p.dist, 0, p.h - 1);
         const float2 u = src[py * p.src_pitch + px];
+        if (fabs(u.x - best.x) + fabs(u.y - best.y) < 0.05f) continue;
         const float e = smear_window_error(L, p.level_pitch, p.w, p.h, x, y, u.x, u.y);
         if (e < best_e) {
             best_e = e;
@@ -466,6 +479,7 @@ KERNEL_B5(smear_motion_refine, SmearMotionRefineParams, GBUF_CONST, cur, GBUF_CO
         const int px = smear_clampi(x + smear_offx(k) * p.dist, 0, p.w - 1);
         const int py = smear_clampi(y + smear_offy(k) * p.dist, 0, p.h - 1);
         const float4 m = src[py * p.src_pitch + px];
+        if (fabs(m.x - best.x) + fabs(m.y - best.y) < 0.01f) continue;
         float occ = 0.0f;
         const float e = smear_motion_cost(c, prev, next, &p, x, y, m.x * p.inv_half, m.y * p.inv_half, &occ);
         if (e < best_e) {
@@ -625,12 +639,18 @@ KERNEL_B5(smear_gather, SmearGatherParams, GBUF_CONST, cur, GBUF_CONST, mot, GBU
         dst[y * p.out_pitch + x] = c;
         return;
     }
+    /* Own vector dominant: nothing nearby moves faster over us, all samples on our streak. */
     const int budget = max(4, p.max_samples);
+    const float dnx = nm.x - m.x, dny = nm.y - m.y;
+    const int own_dominant = dnx * dnx + dny * dny < 0.25f;
     int nb = 0;
-    if (lx >= 0.5f) nb = min(budget / 2, max(2, 2 * (int)ceil(lx)));
+    if (lx >= 0.5f) nb = min(own_dominant ? budget : budget / 2, max(2, 2 * (int)ceil(lx)));
     nb = (nb / 2) * 2;
-    int na = min(budget - nb, max(2, 2 * (int)ceil(ln)));
-    na = max(2, (na / 2) * 2);
+    int na = 0;
+    if (!own_dominant) {
+        na = min(budget - nb, max(2, 2 * (int)ceil(ln)));
+        na = max(2, (na / 2) * 2);
+    }
 
     const float ndx = nm.x / ln, ndy = nm.y / ln;
     const float lxn = fabs(m.x * ndx + m.y * ndy);
@@ -639,11 +659,10 @@ KERNEL_B5(smear_gather, SmearGatherParams, GBUF_CONST, cur, GBUF_CONST, mot, GBU
     /* Front coverage: layers whose streaks pass over this pixel. */
     float fw = 0.0f;
     float4 fc = F4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float da = 2.0f * ln / (float)na;
+    const float da = na > 0 ? 2.0f * ln / (float)na : 0.0f;
     for (int i = 0; i < na; ++i) {
         const float s = -1.0f + (2.0f * (float)i + 1.0f) / (float)na;
-        const float px = fpx + s * nm.x, py = fpy + s * nm.y;
-        if (!smear_inside(p.w, p.h, px, py)) continue;
+        const float px = fpx + s * nm.x, py = fpy + s * nm.y; /* outside: edge pixels extend */
         const int ix = smear_clampi((int)floor(px + 0.5f), 0, p.w - 1), iy = smear_clampi((int)floor(py + 0.5f), 0, p.h - 1);
         const float4 my = mot[iy * p.mot_pitch + ix];
         const float zy = smear_front(my.x, my.y, bgx, bgy, gate, &p);
@@ -660,7 +679,7 @@ KERNEL_B5(smear_gather, SmearGatherParams, GBUF_CONST, cur, GBUF_CONST, mot, GBU
     }
 
     /* Own layer (and whatever is behind it) blurred along our own streak. */
-    const float wc = 1.0f / (2.0f * lx + 1.0f);
+    const float wc = (nb > 0 ? 0.01f : 1.0f) / (2.0f * lx + 1.0f);
     float bw = wc;
     float4 bc = c * wc;
     if (nb > 0) {
@@ -668,7 +687,6 @@ KERNEL_B5(smear_gather, SmearGatherParams, GBUF_CONST, cur, GBUF_CONST, mot, GBU
         for (int i = 0; i < nb; ++i) {
             const float s = -1.0f + (2.0f * (float)i + 1.0f) / (float)nb;
             const float px = fpx + s * m.x, py = fpy + s * m.y;
-            if (!smear_inside(p.w, p.h, px, py)) continue;
             const int ix = smear_clampi((int)floor(px + 0.5f), 0, p.w - 1), iy = smear_clampi((int)floor(py + 0.5f), 0, p.h - 1);
             const float4 my = mot[iy * p.mot_pitch + ix];
             const float zy = smear_front(my.x, my.y, bgx, bgy, gate, &p);

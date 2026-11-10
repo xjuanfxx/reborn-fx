@@ -38,7 +38,9 @@ typedef struct SmearPatchParams {
     int patch, stride, nx, ny, patch_pitch;
     int iterations;
     int radius;                /* integer search radius */
+    int rescue;                /* wide search radius for poorly matched patches (0 = none) */
     float max_step, min_det;
+    float rescue_ratio, rescue_min_var;
 } SmearPatchParams;
 
 /* smear_flow_densify, grid w × h: dense flow of one level from its patches. */
