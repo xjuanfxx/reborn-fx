@@ -1,0 +1,141 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["*-v*"]  # <plugin>-v<version>, e.g. tremor-v0.1.0, publishes a release
+  pull_request:
+  workflow_dispatch:
+
+# The Adobe SDK is not redistributable, so it lives in a private repository
+# (xjuanfxx/ae-sdk: Headers/, Util/, Resources/) read with a deploy key stored as
+# the AE_SDK_DEPLOY_KEY secret. Without the secret (forks) only the cores and
+# their tests are built.
+env:
+  HAS_SDK: ${{ secrets.AE_SDK_DEPLOY_KEY != '' }}
+
+jobs:
+  windows:
+    # VS 2022: the VS 2026 STL requires CUDA 13.2+, and the kernels use CUDA 12.8
+    # (the last CUDA that still targets GTX 10-series GPUs).
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch After Effects SDK
+        if: env.HAS_SDK == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: xjuanfxx/ae-sdk
+          ssh-key: ${{ secrets.AE_SDK_DEPLOY_KEY }}
+          path: third_party/ae_sdk
+      - name: Install CUDA compiler (nvcc 12.8, for the PTX kernels)
+        shell: pwsh
+        run: |
+          $base = "https://developer.download.nvidia.com/compute/cuda/redist"
+          $parts = @(
+            @{ path = "cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.8.93-archive.zip";
+               sha = "9fdc70b4271ed9aad4d64cd7076a7d96ec36512d074b9995fe638de669197391" },
+            @{ path = "cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.8.90-archive.zip";
+               sha = "4a39058fd8519444a81cfc7ae055d136f48d1a31ffa41ae255b35b2edd61e13b" }
+          )
+          $cuda = Join-Path $env:RUNNER_TEMP "cuda"
+          New-Item -ItemType Directory -Force $cuda | Out-Null
+          foreach ($p in $parts) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $p.path -Leaf)
+            Invoke-WebRequest "$base/$($p.path)" -OutFile $zip
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $p.sha) { throw "Checksum mismatch: $zip" }
+            $tmp = Join-Path $env:RUNNER_TEMP "x"
+            Expand-Archive $zip -DestinationPath $tmp -Force
+            Get-ChildItem $tmp -Directory | ForEach-Object { Copy-Item "$($_.FullName)\*" $cuda -Recurse -Force }
+            Remove-Item $tmp -Recurse -Force
+          }
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        if: env.HAS_SDK == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Get-ChildItem build/bin/Release -Filter *.aex | ForEach-Object {
+            Compress-Archive $_.FullName "dist/$($_.BaseName)-windows.zip" -Force
+          }
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_SDK == 'true'
+        with:
+          name: windows
+          path: dist/*.zip
+
+  macos:
+    runs-on: macos-15  # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch After Effects SDK
+        if: env.HAS_SDK == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: xjuanfxx/ae-sdk
+          ssh-key: ${{ secrets.AE_SDK_DEPLOY_KEY }}
+          path: third_party/ae_sdk
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Validate Metal kernels
+        run: |
+          if ! xcrun -sdk macosx -f metal > /dev/null 2>&1; then
+            echo "::warning::Metal compiler not available on this runner; kernels not validated"
+            exit 0
+          fi
+          for gpu in plugins/*/plugin/gpu; do
+            name=$(basename "$(dirname "$(dirname "$gpu")")")
+            src="$RUNNER_TEMP/${name}_kernels.metal"
+            cat "$gpu/prelude_metal.metal" "$gpu/${name}_gpu_types.h" "$gpu/${name}_kernels.inc" > "$src"
+            xcrun -sdk macosx metal -c "$src" -o "$RUNNER_TEMP/${name}_kernels.air"
+            echo "$name: Metal kernels compile"
+          done
+      - name: Verify, sign (ad hoc) and package
+        if: env.HAS_SDK == 'true'
+        run: |
+          mkdir -p dist
+          find build -name '*.plugin' -type d -prune | while read -r plugin; do
+            name=$(basename "$plugin" .plugin)
+            lipo -info "$plugin/Contents/MacOS/$name"
+            test -s "$plugin/Contents/Resources/$name.rsrc"
+            codesign --force --deep --sign - "$plugin"
+            codesign --verify --verbose "$plugin"
+            ditto -c -k --keepParent "$plugin" "dist/$name-macos.zip"
+          done
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_SDK == 'true'
+        with:
+          name: macos
+          path: dist/*.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the tagged plugin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          plugin="${TAG%-v*}"                                                 # tremor-v0.1.0 -> tremor
+          name="$(tr '[:lower:]' '[:upper:]' <<< "${plugin:0:1}")${plugin:1}"  # -> Tremor
+          ls dist
+          gh release create "$TAG" dist/"$name"-*.zip --repo "$GITHUB_REPOSITORY" \
+            --title "$name ${TAG##*-v}" --generate-notes

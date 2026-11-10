@@ -1,0 +1,15 @@
+# Build output
+build/
+out/
+dist/
+
+# Adobe After Effects SDK: not redistributable, each developer provides it
+third_party/ae_sdk/
+
+# Original third-party binaries: not ours, never committed
+*.aex
+*.AEX
+*.plugin/
+
+# Local analysis notes and artifacts
+analysis/
