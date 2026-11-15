@@ -14,6 +14,8 @@ stopped evolving, rebuilt from scratch with new code and a modern feature set:
 | --- | --- | --- |
 | [Tremor](plugins/tremor) | Unsteady camera: sway, breathing zoom, small turns with RGB fringing and random jolts. | [behaviour](plugins/tremor/docs/behaviour.md) |
 | [Analog](plugins/analog) | Composite video and VHS tape: chroma bleed, dot crawl, FM luma, tape errors, line jitter and roll. | [behaviour](plugins/analog/docs/behaviour.md) |
+| [Crosstalk](plugins/crosstalk) | Interlaced field interference: alternating bands of rows with their own tint, noise, echo, displacement and column comb. | [behaviour](plugins/crosstalk/docs/behaviour.md) |
+| [Reception](plugins/reception) | Bad TV reception: flicker, snow, wavy distortion, glow, ghost images, a rolling bar and lost vertical hold. | [behaviour](plugins/reception/docs/behaviour.md) |
 
 ## Downloads
 

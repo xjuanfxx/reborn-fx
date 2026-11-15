@@ -34,3 +34,5 @@ set(AE_SDK_DIR "${ae_sdk_default}"
 
 add_subdirectory(plugins/tremor)
 add_subdirectory(plugins/analog)
+add_subdirectory(plugins/crosstalk)
+add_subdirectory(plugins/reception)
