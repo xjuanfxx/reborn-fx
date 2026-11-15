@@ -27,9 +27,6 @@ Colour values below are 0–1 (8 bpc: /255); 32 bpc keeps values above 1.
    past the layer, *Edges* decides what shows: Transparent, Mirror, Tile (default)
    or Black.
 3. **Tint** (when on) — `L = (R+G+B)/3`, tinted colour = `L × Tint Color`.
-   **Comb Filt. Level**: in columns where `column AND level` is not 0
-   (1: every other column, 2: two of every four, …) the tinted colour is black.
-   At reduced resolution a pixel keeps the share of its columns that survive.
 4. **Process Input** — `v = (1 − p)·source + p·tinted`, `p` = *Process Input*/100.
 5. **Luminance and noise** — `v += Luminance/100 + n`, `n` random in
    ±*Noise Level*/100, one value per pixel, or one per channel with *Chroma Noise*.
@@ -43,7 +40,10 @@ Colour values below are 0–1 (8 bpc: /255); 32 bpc keeps values above 1.
 7. Clip to [0, 1] (8/16 bpc) or [0, ∞) (32 bpc), then add the source once more,
    `v += (1 − p)·source`, and clip again: where Luminance and the echo pushed
    dark areas to black, the picture comes back. Alpha is the source alpha.
-8. **Blend With Original** — cross-fade back to the untouched source.
+8. **Comb Filt. Level** — a column is blanked (transparent) when
+   `column AND level` is not 0 (1: every other column, 2: two of every four, …).
+   At reduced resolution a pixel keeps the share of its columns that survive.
+9. **Blend With Original** — cross-fade back to the untouched source.
 
 Noise and Noisy displacement change every frame and with *Random Seed*; the
 same frame always renders the same.

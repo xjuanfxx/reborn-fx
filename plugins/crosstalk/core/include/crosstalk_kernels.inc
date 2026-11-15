@@ -145,11 +145,6 @@ KERNEL(crosstalk_render, CrosstalkParams)
         tg = l * p.tint_g[f];
         tr = l * p.tint_r[f];
     }
-    /* Comb filter: blanked columns lose the tinted signal (the source still mixes in). */
-    const float pass = ct_comb_pass(p, p.comb[f], cx);
-    tb *= pass;
-    tg *= pass;
-    tr *= pass;
     const float pr = p.process[f], keep = 1.0f - pr;
     float vb = keep * s.x + pr * tb, vg = keep * s.y + pr * tg, vr = keep * s.z + pr * tr;
 
@@ -202,7 +197,8 @@ KERNEL(crosstalk_render, CrosstalkParams)
     vg = FMIN(vg + keep * s.y, hi);
     vr = FMIN(vr + keep * s.z, hi);
 
-    const float alpha = s.w;
+    /* Comb filter: blanked columns turn transparent. */
+    const float alpha = s.w * ct_comb_pass(p, p.comb[f], cx);
     float4 o = F4(vb * alpha, vg * alpha, vr * alpha, alpha);
 
     const float bl = p.blend, bk = 1.0f - bl;

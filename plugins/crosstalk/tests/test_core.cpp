@@ -148,12 +148,11 @@ int main() {
         crosstalk::Params c = neutral();
         c.even.comb = c.odd.comb = 1;
         const std::vector<float4> full = render(c, f, in);
-        // Process Input 100%: a blanked column is black (opaque), a kept one the source.
-        check(full[1].z == 0 && full[1].w == 1 && std::fabs(full[2].z - in[2].z) < 1e-6f, "comb blanks odd columns");
+        check(full[1].w == 0 && full[2].w == 1, "comb blanks odd columns");
         const crosstalk::Frame half = frame(w, h, 0.5);
         const std::vector<float4> in_half = picture(half.in_w, half.in_h);
         const std::vector<float4> out_half = render(c, half, in_half);
-        check(std::fabs(out_half[3].z - 0.5f * in_half[3].z) < 1e-5f, "comb keeps its average at half resolution");
+        check(std::fabs(out_half[3].w - 0.5f) < 1e-6f, "comb keeps its average at half resolution");
     }
 
     {
