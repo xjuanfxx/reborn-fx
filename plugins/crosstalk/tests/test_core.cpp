@@ -38,11 +38,12 @@ crosstalk::Frame frame(int w, int h, double ds = 1.0) {
     return f;
 }
 
-// Settings that leave the picture alone.
+// Settings that leave the picture alone (Process Input 100% of an untinted picture).
 crosstalk::Params neutral() {
     crosstalk::Params c;
     for (crosstalk::Field* f : {&c.even, &c.odd}) {
-        f->process = 0;
+        f->process = 100;
+        f->tint = false;
         f->luminance = 0;
         f->noise = 0;
         f->decay = 1;
@@ -103,12 +104,24 @@ int main() {
     {
         // Process Input 100% with a white tint: grey = (R + G + B) / 3.
         crosstalk::Params c = neutral();
-        c.even.process = c.odd.process = 100;
+        c.even.tint = c.odd.tint = true;
         const std::vector<float4> out = render(c, f, in);
         const float4 s = in[size_t(8) * w + 10], o = out[size_t(8) * w + 10];  // row 8: even field
         const float l = (s.x + s.y + s.z) / 3;
         check(std::fabs(o.x - l * 248 / 255.0f) < 1e-5f && std::fabs(o.y - l) < 1e-5f,
               "tint maps luminance to the tint colour");
+    }
+
+    {
+        // Defaults on a dark picture: odd rows keep it (the source comes back on
+        // top of the clipped echo), even rows are darker but not black.
+        std::vector<float4> dark(size_t(w) * h, float4{0.35f, 0.1f, 0.1f, 1.0f});
+        crosstalk::Params c;
+        c.odd.comb = 0;
+        c.even.noise = c.odd.noise = 0;
+        const std::vector<float4> out = render(c, f, dark);
+        const float4 odd = out[size_t(2) * w + 50], even = out[size_t(0) * w + 50];
+        check(odd.x > 0.3f && even.x > 0.05f && even.x < odd.x, "default look: dark picture survives");
     }
 
     {
@@ -135,11 +148,12 @@ int main() {
         crosstalk::Params c = neutral();
         c.even.comb = c.odd.comb = 1;
         const std::vector<float4> full = render(c, f, in);
-        check(full[1].w == 0 && full[2].w == 1, "comb blanks odd columns");
+        // Process Input 100%: a blanked column is black (opaque), a kept one the source.
+        check(full[1].z == 0 && full[1].w == 1 && std::fabs(full[2].z - in[2].z) < 1e-6f, "comb blanks odd columns");
         const crosstalk::Frame half = frame(w, h, 0.5);
         const std::vector<float4> in_half = picture(half.in_w, half.in_h);
         const std::vector<float4> out_half = render(c, half, in_half);
-        check(std::fabs(out_half[3].w - 0.5f) < 1e-6f, "comb keeps its average at half resolution");
+        check(std::fabs(out_half[3].z - 0.5f * in_half[3].z) < 1e-5f, "comb keeps its average at half resolution");
     }
 
     {
