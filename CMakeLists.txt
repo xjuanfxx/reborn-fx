@@ -33,3 +33,4 @@ set(AE_SDK_DIR "${ae_sdk_default}"
     CACHE PATH "Folder with the After Effects SDK Headers/, Util/ and Resources/")
 
 add_subdirectory(plugins/tremor)
+add_subdirectory(plugins/analog)

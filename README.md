@@ -13,6 +13,7 @@ stopped evolving, rebuilt from scratch with new code and a modern feature set:
 | Plugin | What it does | Docs |
 | --- | --- | --- |
 | [Tremor](plugins/tremor) | Unsteady camera: sway, breathing zoom, small turns with RGB fringing and random jolts. | [behaviour](plugins/tremor/docs/behaviour.md) |
+| [Analog](plugins/analog) | Composite video and VHS tape: chroma bleed, dot crawl, FM luma, tape errors, line jitter and roll. | [behaviour](plugins/analog/docs/behaviour.md) |
 
 ## Downloads
 
