@@ -96,7 +96,13 @@ jobs:
           for gpu in plugins/*/plugin/gpu; do
             name=$(basename "$(dirname "$(dirname "$gpu")")")
             src="$RUNNER_TEMP/${name}_kernels.metal"
-            cat "$gpu/prelude_metal.metal" "$gpu/${name}_gpu_types.h" "$gpu/${name}_kernels.inc" > "$src"
+            # Kernel sources live in plugin/gpu, or in core/include when the CPU shares them.
+            if [ -f "$gpu/${name}_kernels.inc" ]; then
+              cat "$gpu/prelude_metal.metal" "$gpu/${name}_gpu_types.h" "$gpu/${name}_kernels.inc" > "$src"
+            else
+              core="$(dirname "$(dirname "$gpu")")/core/include"
+              cat "$gpu/prelude_metal.metal" "$core/${name}_types.h" "$core/${name}_kernels.inc" > "$src"
+            fi
             xcrun -sdk macosx metal -c "$src" -o "$RUNNER_TEMP/${name}_kernels.air"
             echo "$name: Metal kernels compile"
           done
